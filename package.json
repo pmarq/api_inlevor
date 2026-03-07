@@ -1,0 +1,17 @@
+{
+  "name": "api-inlevor",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "start:worker": "node worker/worker.js",
+    "start:worker:inlevor": "set DOTENV_CONFIG_PATH=worker\\.env.inlevor && node worker/worker.js",
+    "start:worker:blog": "set DOTENV_CONFIG_PATH=worker\\.env.blog && node worker/worker.js"
+  },
+  "dependencies": {
+    "@qdrant/js-client-rest": "1.16.1",
+    "dotenv": "^16.4.5",
+    "fastify": "^4.26.2",
+    "firebase-admin": "^12.7.0"
+  }
+}

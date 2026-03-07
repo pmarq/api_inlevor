@@ -1,0 +1,6 @@
+node_modules
+.env
+worker/.env
+worker/.env.inlevor
+worker/.env.blog
+.DS_Store
