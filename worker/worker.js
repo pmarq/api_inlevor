@@ -57,20 +57,52 @@ const JOB_TYPE = process.env.JOB_TYPE || "extract_facts";
 const QDRANT_INGEST_URL = process.env.QDRANT_INGEST_URL;
 const SOURCE_PROJECT = process.env.SOURCE_PROJECT;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function chunkText(text) {
   const cleaned = (text || "").replace(/\s+/g, " ").trim();
   if (!cleaned) return [];
+
+  if (CHUNK_SIZE <= 0) {
+    throw new Error(`Invalid CHUNK_SIZE: ${CHUNK_SIZE}`);
+  }
+
+  if (CHUNK_OVERLAP < 0) {
+    throw new Error(`Invalid CHUNK_OVERLAP: ${CHUNK_OVERLAP}`);
+  }
+
+  if (CHUNK_OVERLAP >= CHUNK_SIZE) {
+    throw new Error(
+      `Invalid chunk config: CHUNK_OVERLAP (${CHUNK_OVERLAP}) must be smaller than CHUNK_SIZE (${CHUNK_SIZE})`,
+    );
+  }
+
   const chunks = [];
   let start = 0;
+
   while (start < cleaned.length) {
     const end = Math.min(start + CHUNK_SIZE, cleaned.length);
     const chunk = cleaned.slice(start, end).trim();
-    if (chunk) chunks.push(chunk);
-    start = end - CHUNK_OVERLAP;
-    if (start < 0) start = 0;
+
+    if (chunk) {
+      chunks.push(chunk);
+    }
+
+    if (end >= cleaned.length) {
+      break;
+    }
+
+    const nextStart = end - CHUNK_OVERLAP;
+
+    if (nextStart <= start) {
+      throw new Error(
+        `Invalid chunk progression: start=${start}, end=${end}, nextStart=${nextStart}`,
+      );
+    }
+
+    start = nextStart;
   }
+
   return chunks;
 }
 
@@ -78,12 +110,15 @@ async function claimJob(docRef) {
   return db.runTransaction(async (tx) => {
     const snap = await tx.get(docRef);
     if (!snap.exists) return null;
+
     const data = snap.data();
     if (!data || data.status !== "queued") return null;
+
     tx.update(docRef, {
       status: "processing",
       updatedAt: new Date(),
     });
+
     return { id: snap.id, ...data };
   });
 }
@@ -141,7 +176,11 @@ async function markJob(docRef, status, error) {
     status,
     updatedAt: new Date(),
   };
-  if (error) update.error = String(error).slice(0, 1000);
+
+  if (error) {
+    update.error = String(error).slice(0, 1000);
+  }
+
   await docRef.update(update);
 }
 
@@ -163,6 +202,10 @@ async function tick() {
       await processJob(claimed);
       await markJob(doc.ref, "done");
     } catch (err) {
+      console.error("Job processing error", {
+        jobId: doc.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
       await markJob(doc.ref, "error", err);
     }
   }
@@ -170,12 +213,24 @@ async function tick() {
 
 async function main() {
   console.log("KB worker started");
+  console.log(
+    JSON.stringify({
+      SOURCE_PROJECT,
+      JOB_TYPE,
+      POLL_INTERVAL_MS,
+      CHUNK_SIZE,
+      CHUNK_OVERLAP,
+      MAX_JOBS_PER_TICK,
+    }),
+  );
+
   while (true) {
     try {
       await tick();
     } catch (err) {
       console.error("Tick error", err);
     }
+
     await sleep(POLL_INTERVAL_MS);
   }
 }
