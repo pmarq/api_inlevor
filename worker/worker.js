@@ -1,5 +1,18 @@
-import "dotenv/config";
+import dotenv from "dotenv";
 import admin from "firebase-admin";
+
+if (process.env.ENV_FILE) {
+  const result = dotenv.config({ path: process.env.ENV_FILE });
+  if (result.error) {
+    throw new Error(
+      `Failed to load ENV_FILE ${process.env.ENV_FILE}: ${result.error.message}`,
+    );
+  }
+  console.log(`Loaded env from ${process.env.ENV_FILE}`);
+} else {
+  dotenv.config();
+  console.log("Loaded env from default .env");
+}
 
 const REQUIRED_ENV = [
   "FIREBASE_PROJECT_ID",
