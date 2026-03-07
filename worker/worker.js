@@ -53,16 +53,15 @@ const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 1200);
 const CHUNK_OVERLAP = Number(process.env.CHUNK_OVERLAP || 200);
 const MAX_JOBS_PER_TICK = Number(process.env.MAX_JOBS_PER_TICK || 3);
 const JOB_TYPE = process.env.JOB_TYPE || "extract_facts";
+const MAX_SOURCE_CHARS = Number(process.env.MAX_SOURCE_CHARS || 500000);
+const INGEST_BATCH_SIZE = Number(process.env.INGEST_BATCH_SIZE || 64);
 
 const QDRANT_INGEST_URL = process.env.QDRANT_INGEST_URL;
 const SOURCE_PROJECT = process.env.SOURCE_PROJECT;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function chunkText(text) {
-  const cleaned = (text || "").replace(/\s+/g, " ").trim();
-  if (!cleaned) return [];
-
+function validateChunkConfig() {
   if (CHUNK_SIZE <= 0) {
     throw new Error(`Invalid CHUNK_SIZE: ${CHUNK_SIZE}`);
   }
@@ -76,8 +75,14 @@ function chunkText(text) {
       `Invalid chunk config: CHUNK_OVERLAP (${CHUNK_OVERLAP}) must be smaller than CHUNK_SIZE (${CHUNK_SIZE})`,
     );
   }
+}
 
-  const chunks = [];
+function* chunkTextIterator(text) {
+  const cleaned = (text || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return;
+
+  validateChunkConfig();
+
   let start = 0;
 
   while (start < cleaned.length) {
@@ -85,7 +90,7 @@ function chunkText(text) {
     const chunk = cleaned.slice(start, end).trim();
 
     if (chunk) {
-      chunks.push(chunk);
+      yield chunk;
     }
 
     if (end >= cleaned.length) {
@@ -102,8 +107,19 @@ function chunkText(text) {
 
     start = nextStart;
   }
+}
 
-  return chunks;
+async function sendBatch(payload) {
+  const res = await fetch(QDRANT_INGEST_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Ingest API failed: ${res.status} ${body}`);
+  }
 }
 
 async function claimJob(docRef) {
@@ -143,31 +159,45 @@ async function processJob(job) {
     throw new Error("No sanitized text available for embeddings");
   }
 
-  const chunks = chunkText(sourceText);
-  if (!chunks.length) {
+  const limitedText =
+    sourceText.length > MAX_SOURCE_CHARS
+      ? sourceText.slice(0, MAX_SOURCE_CHARS)
+      : sourceText;
+
+  const source = residentialText ? "residential" : "raw";
+  const batch = [];
+  let index = 0;
+
+  for (const chunk of chunkTextIterator(limitedText)) {
+    batch.push({
+      id: `${SOURCE_PROJECT}:${projectId}:${index}`,
+      text: chunk,
+      index,
+    });
+    index += 1;
+
+    if (batch.length >= INGEST_BATCH_SIZE) {
+      await sendBatch({
+        sourceProject: SOURCE_PROJECT,
+        projectId,
+        source,
+        chunks: batch,
+      });
+      batch.length = 0;
+    }
+  }
+
+  if (!index) {
     throw new Error("Chunking produced no text");
   }
 
-  const payload = {
-    sourceProject: SOURCE_PROJECT,
-    projectId,
-    source: residentialText ? "residential" : "raw",
-    chunks: chunks.map((text, index) => ({
-      id: `${SOURCE_PROJECT}:${projectId}:${index}`,
-      text,
-      index,
-    })),
-  };
-
-  const res = await fetch(QDRANT_INGEST_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Ingest API failed: ${res.status} ${body}`);
+  if (batch.length) {
+    await sendBatch({
+      sourceProject: SOURCE_PROJECT,
+      projectId,
+      source,
+      chunks: batch,
+    });
   }
 }
 
@@ -221,6 +251,8 @@ async function main() {
       CHUNK_SIZE,
       CHUNK_OVERLAP,
       MAX_JOBS_PER_TICK,
+      MAX_SOURCE_CHARS,
+      INGEST_BATCH_SIZE,
     }),
   );
 
