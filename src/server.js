@@ -1,6 +1,8 @@
 import dotenv from "dotenv";
 import Fastify from "fastify";
+import multipart from "@fastify/multipart";
 import { QdrantClient } from "@qdrant/js-client-rest";
+import { createRequire } from "node:module";
 
 if (process.env.ENV_FILE) {
   const result = dotenv.config({ path: process.env.ENV_FILE });
@@ -28,6 +30,7 @@ const EMBEDDINGS_MODEL =
   process.env.EMBEDDINGS_MODEL || "text-embedding-3-small";
 const EMBEDDINGS_API_KEY =
   process.env.EMBEDDINGS_API_KEY || process.env.OPENAI_API_KEY;
+const PDF_EXTRACT_API_KEY = process.env.PDF_EXTRACT_API_KEY;
 
 if (!QDRANT_URL) {
   throw new Error("Missing required env var: QDRANT_URL");
@@ -37,6 +40,8 @@ const qdrant = new QdrantClient({
   url: QDRANT_URL,
   apiKey: QDRANT_API_KEY,
 });
+
+const require = createRequire(import.meta.url);
 
 const chunkArray = (items, size) => {
   const chunks = [];
@@ -58,6 +63,116 @@ const ensureEmbeddingsApiKey = () => {
   if (!EMBEDDINGS_API_KEY) {
     throw new Error("Missing EMBEDDINGS_API_KEY (or OPENAI_API_KEY)");
   }
+};
+
+const ensureCanvasPolyfill = async () => {
+  if (globalThis.DOMMatrix && globalThis.ImageData && globalThis.Path2D) {
+    return;
+  }
+  try {
+    const canvas = await import("@napi-rs/canvas");
+    if (!globalThis.DOMMatrix) globalThis.DOMMatrix = canvas.DOMMatrix;
+    if (!globalThis.ImageData) globalThis.ImageData = canvas.ImageData;
+    if (!globalThis.Path2D) globalThis.Path2D = canvas.Path2D;
+  } catch (err) {
+    fastify.log.warn(
+      { err },
+      "Canvas polyfill not available; PDF extraction may fail",
+    );
+  }
+};
+
+const loadPdfParse = async () => {
+  const mod = require("pdf-parse");
+  return mod?.default ?? mod;
+};
+
+const isPageTextPoor = (text) => {
+  const t = (text || "").trim();
+  const charCount = t.length;
+  const words = t.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
+
+  const alphaCount = (t.match(/[A-Za-z\u00C0-\u00FF]/g) || []).length;
+  const alphaRatio = charCount ? alphaCount / charCount : 0;
+
+  const uniq = new Set(words.map((w) => w.toLowerCase()));
+  const uniqueWordRatio = wordCount ? uniq.size / wordCount : 0;
+
+  if (charCount < 200) return true;
+  if (wordCount < 40) return true;
+  if (alphaRatio < 0.22) return true;
+  if (uniqueWordRatio < 0.25 && wordCount > 80) return true;
+
+  return false;
+};
+
+const extractTextByPage = async (data) => {
+  await ensureCanvasPolyfill();
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const uint8Array = Buffer.isBuffer(data) ? new Uint8Array(data) : data;
+  const loadingTask = pdfjs.getDocument({
+    data: uint8Array,
+    disableWorker: true,
+  });
+  const pdf = await loadingTask.promise;
+
+  const pages = [];
+  for (let p = 1; p <= pdf.numPages; p += 1) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    const text = content.items
+      .map((item) => (typeof item.str === "string" ? item.str : ""))
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const wordCount = text ? text.split(/\s+/).filter(Boolean).length : 0;
+    pages.push({
+      page: p,
+      text,
+      charCount: text.length,
+      wordCount,
+    });
+  }
+
+  await pdf.destroy();
+  return pages;
+};
+
+const buildTextFromPages = (pages) => {
+  const poorPages = [];
+  const goodPages = [];
+
+  const scored = pages.map((page) => {
+    const poor = isPageTextPoor(page.text);
+    if (poor) poorPages.push(page.page);
+    else goodPages.push(page.page);
+    return { ...page, poor };
+  });
+
+  const goodText = scored
+    .filter((page) => !page.poor)
+    .map((page) => page.text)
+    .filter(Boolean)
+    .join("\n\n");
+
+  const fullText = scored
+    .map((page) => page.text)
+    .filter(Boolean)
+    .join("\n\n");
+
+  const chosenText = goodText.length >= 500 ? goodText : fullText;
+
+  const metrics = {
+    totalPages: pages.length,
+    poorPages,
+    goodPages,
+    chosenChars: chosenText.length,
+    fullChars: fullText.length,
+    goodChars: goodText.length,
+  };
+
+  return { chosenText, metrics };
 };
 
 async function embedTexts(texts) {
@@ -89,6 +204,12 @@ async function embedTexts(texts) {
 
   return vectors;
 }
+
+fastify.register(multipart, {
+  limits: {
+    fileSize: 25 * 1024 * 1024,
+  },
+});
 
 fastify.get("/health", async () => {
   return { status: "ok", service: "api_inlevor" };
@@ -251,6 +372,57 @@ fastify.post("/ai/ingest", async (req, reply) => {
     ok: true,
     inserted: points.length,
   };
+});
+
+fastify.post("/pdf/extract", async (req, reply) => {
+  const apiKeyHeader = req.headers["x-api-key"];
+  if (PDF_EXTRACT_API_KEY && apiKeyHeader !== PDF_EXTRACT_API_KEY) {
+    return reply.code(401).send({ ok: false, error: "Unauthorized" });
+  }
+
+  let fileBuffer = null;
+
+  try {
+    const parts = req.parts();
+    for await (const part of parts) {
+      if (part.type === "file" && part.fieldname === "file") {
+        fileBuffer = await part.toBuffer();
+      }
+    }
+  } catch (err) {
+    req.log.error({ err }, "Failed to read multipart payload");
+    return reply.code(400).send({ ok: false, error: "Payload inválido." });
+  }
+
+  if (!fileBuffer) {
+    return reply.code(400).send({ ok: false, error: "PDF não enviado." });
+  }
+
+  try {
+    const pages = await extractTextByPage(fileBuffer);
+    const { chosenText, metrics } = buildTextFromPages(pages);
+    return {
+      ok: true,
+      rawText: chosenText,
+      pages,
+      pageMetrics: metrics,
+    };
+  } catch (error) {
+    req.log.warn(
+      { error },
+      "pdfjs failed, fallback pdf-parse on /pdf/extract",
+    );
+    const pdfParse = await loadPdfParse();
+    const parser = new pdfParse.PDFParse({ data: fileBuffer });
+    const parsed = await parser.getText();
+    await parser.destroy?.();
+    const rawText = parsed.text || "";
+    return {
+      ok: true,
+      rawText,
+      pageMetrics: { fallback: "pdf-parse", rawChars: rawText.length },
+    };
+  }
 });
 
 async function start() {
