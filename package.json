@@ -9,7 +9,7 @@
     "start:worker:blog": "set DOTENV_CONFIG_PATH=worker\\.env.blog && node worker/worker.js"
   },
   "dependencies": {
-    "@fastify/multipart": "^9.4.0",
+    "@fastify/multipart": "^8.3.1",
     "@napi-rs/canvas": "^0.1.96",
     "@qdrant/js-client-rest": "1.16.1",
     "dotenv": "^16.4.5",
