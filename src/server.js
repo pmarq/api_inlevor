@@ -401,10 +401,16 @@ fastify.post("/pdf/extract", async (req, reply) => {
   try {
     const pages = await extractTextByPage(fileBuffer);
     const { chosenText, metrics } = buildTextFromPages(pages);
+    const metadata = {
+      pageCount: pages.length,
+      extractor: "pdfjs",
+      warnings: [],
+    };
     return {
       ok: true,
       rawText: chosenText,
       pages,
+      metadata,
       pageMetrics: metrics,
     };
   } catch (error) {
@@ -417,9 +423,16 @@ fastify.post("/pdf/extract", async (req, reply) => {
     const parsed = await parser.getText();
     await parser.destroy?.();
     const rawText = parsed.text || "";
+    const metadata = {
+      pageCount: null,
+      extractor: "pdf-parse",
+      warnings: ["pdfjs_failed_fallback_pdf_parse"],
+    };
     return {
       ok: true,
       rawText,
+      pages: null,
+      metadata,
       pageMetrics: { fallback: "pdf-parse", rawChars: rawText.length },
     };
   }
